@@ -2,6 +2,7 @@ streamlit
 pdfplumber
 python-docx
 pytesseract
+pdf2image
 easyocr
 Pillow
 dateparser
