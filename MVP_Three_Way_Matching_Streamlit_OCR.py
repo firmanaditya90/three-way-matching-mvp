@@ -1,10 +1,15 @@
 # app.py
 """
-Three-Way Matching — Full, fast-first, OCR fallback (Streamlit)
-- Prioritize page1(no-OCR) for speed; fallback OCR only when needed.
-- Extract: nomor_kontrak (page1-priority), tanggal_mulai (page1), tanggal_selesai (from duration), nilai_kontrak (Pasal Biaya Pelaksanaan Pekerjaan).
-- Extract BA & Invoice and perform three-way matching.
-- Cache per-file to avoid reprocessing.
+Three-Way Matching — Fast-first + OCR fallback (full workflow)
+- Prioritize page1 text extraction (fast). If page1 empty -> OCR page1 only (faster).
+- If needed, OCR more pages (controlled by sidebar).
+- Extract contract: nomor_kontrak (page1-priority), tanggal_mulai (page1), tanggal_selesai (computed from pasal duration),
+  nilai_kontrak (from Pasal Biaya Pelaksanaan Pekerjaan -> fallback to Total/Nilai first Rp).
+- Extract BA and Invoice, then do validations:
+    - BA in contract period -> MATCH / NOT MATCH
+    - Invoice date >= BA date -> MATCH / NOT MATCH
+    - Invoice amount within tolerance vs contract -> MATCH / NOT MATCH
+- Caches extraction per-file (hash) to avoid repeating OCR.
 """
 
 import streamlit as st
@@ -13,14 +18,14 @@ from datetime import timedelta
 import dateparser
 import pandas as pd
 
-# OCR / PDF libraries
+# PDF & OCR libs
 import pdfplumber
 from pdf2image import convert_from_bytes
 from PIL import Image
 import pytesseract
 
 # Page config
-st.set_page_config(page_title="Three-Way Matching (Fast + OCR)", layout="wide")
+st.set_page_config(page_title="Three-Way Matching (Fast-OCR)", layout="wide")
 
 # -------------------------
 # Utilities
@@ -54,7 +59,6 @@ def normalize_amount_raw(s):
     s = s.replace("Rp", "").replace("rp", "").replace("IDR", "")
     s = s.replace(",-", "")
     s = re.sub(r"[^\d,\.]", "", s)
-    # Indonesian thousands: dot; decimal: comma (handle both)
     if s.count(",") == 1 and s.count(".") > 1:
         s = s.replace(".", "").replace(",", ".")
     else:
@@ -70,118 +74,109 @@ def file_sha256_bytes(b: bytes):
     return h.hexdigest()
 
 # -------------------------
-# Text extraction helpers
+# Text extraction: page1-first, then OCR page1 only, then limited/full OCR
 # -------------------------
-def ocr_pil_image(pil_img, ocr_lang, tconfig):
+def ocr_pil_image(pil_img, ocr_lang="ind", config="--psm 6"):
     try:
-        return pytesseract.image_to_string(pil_img, lang=ocr_lang, config=tconfig)
+        return pytesseract.image_to_string(pil_img, lang=ocr_lang, config=config)
     except Exception:
         try:
             return pytesseract.image_to_string(pil_img)
         except Exception:
             return ""
 
-def extract_text_and_page1_from_bytes(bytes_data, ocr_lang="ind", max_pages=None, dpi=200, force_ocr=False, psm=6):
+def extract_text_page1_quick(bytes_data, ocr_lang="ind", dpi=200, psm=6):
     """
-    Returns (full_text, page1_text)
-    Strategy:
-      - Try pdfplumber.extract_text per page; if page text short OR force_ocr -> OCR that page only.
-      - If pdfplumber fails entirely -> use pdf2image convert_from_bytes + OCR pages.
-      - max_pages limits work for speed (None => all)
+    Try to get textual page1 quickly:
+    1) pdfplumber.extract_text() for page 1 (very fast)
+    2) if empty -> OCR page1 only via pdfplumber page.to_image() or pdf2image if pdfplumber fails
+    Returns (page1_text, full_text_estimate) where full_text_estimate may be empty.
+    """
+    tconfig = f"--psm {psm}"
+    # try pdfplumber page 1
+    try:
+        with pdfplumber.open(io.BytesIO(bytes_data)) as pdf:
+            if len(pdf.pages) == 0:
+                return "", ""
+            p = pdf.pages[0]
+            page_text = p.extract_text() or ""
+            if page_text.strip():
+                return clean_text(page_text), ""
+            # empty -> OCR page 1 using pdfplumber image (faster than convert_from_bytes)
+            try:
+                pil = p.to_image(resolution=dpi).original
+                ocr_txt = ocr_pil_image(pil, ocr_lang=ocr_lang, config=tconfig)
+                return clean_text(ocr_txt), ""
+            except Exception:
+                # fallback to pdf2image for page 1
+                images = convert_from_bytes(bytes_data, dpi=dpi, first_page=1, last_page=1)
+                if images:
+                    ocr_txt = ocr_pil_image(images[0], ocr_lang=ocr_lang, config=tconfig)
+                    return clean_text(ocr_txt), ""
+                return "", ""
+    except Exception:
+        # pdfplumber failed; try pdf2image page1
+        try:
+            images = convert_from_bytes(bytes_data, dpi=dpi, first_page=1, last_page=1)
+            if images:
+                ocr_txt = ocr_pil_image(images[0], ocr_lang=ocr_lang, config=tconfig)
+                return clean_text(ocr_txt), ""
+        except Exception:
+            pass
+    return "", ""
+
+def extract_text_limited_or_full(bytes_data, ocr_lang="ind", max_pages=3, dpi=200, psm=6):
+    """
+    Extract up to max_pages (if max_pages None: full document) using pdfplumber extract_text,
+    performing OCR per-page when page text is short. If pdfplumber fails, convert_from_bytes + OCR pages.
+    Returns full_text.
     """
     tconfig = f"--psm {psm}"
     full_text = ""
-    page1_text = ""
-
-    if not force_ocr:
-        try:
-            with pdfplumber.open(io.BytesIO(bytes_data)) as pdf:
-                pages = pdf.pages
-                if len(pages) == 0:
-                    raise RuntimeError("Empty PDF")
-                pages_to_iter = pages if not max_pages else pages[:max_pages]
-                for i, p in enumerate(pages_to_iter):
-                    txt = p.extract_text() or ""
-                    if len(txt.strip()) < 20 or force_ocr:
-                        # OCR this page only
-                        try:
-                            pil = p.to_image(resolution=dpi).original
-                            ocr_txt = ocr_pil_image(pil, ocr_lang, tconfig)
-                            txt = ocr_txt or txt
-                        except Exception:
-                            pass
-                    full_text += "\n" + (txt or "")
-                    if i == 0:
-                        page1_text = txt or ""
-            return clean_text(full_text), clean_text(page1_text)
-        except Exception:
-            # fallback to full OCR
-            pass
-
-    # fallback full OCR via pdf2image
     try:
-        pil_pages = convert_from_bytes(bytes_data, dpi=dpi)
-        for i, pil in enumerate(pil_pages):
-            try:
-                ocr_txt = ocr_pil_image(pil, ocr_lang, tconfig)
-            except Exception:
-                ocr_txt = ""
-            full_text += "\n" + (ocr_txt or "")
-            if i == 0:
-                page1_text = ocr_txt or ""
-            if max_pages and i+1 >= max_pages:
-                break
-        return clean_text(full_text), clean_text(page1_text)
+        with pdfplumber.open(io.BytesIO(bytes_data)) as pdf:
+            pages = pdf.pages
+            pages_to_iter = pages if (not max_pages or max_pages==0) else pages[:max_pages]
+            for p in pages_to_iter:
+                txt = p.extract_text() or ""
+                if len(txt.strip()) < 20:
+                    try:
+                        pil = p.to_image(resolution=dpi).original
+                        txt = ocr_pil_image(pil, ocr_lang=ocr_lang, config=tconfig) or txt
+                    except Exception:
+                        pass
+                full_text += "\n" + (txt or "")
+        return clean_text(full_text)
     except Exception:
-        return "", ""
+        # fallback to convert_from_bytes + OCR pages
+        try:
+            pil_pages = convert_from_bytes(bytes_data, dpi=dpi)
+            pages_to_iter = pil_pages if (not max_pages or max_pages==0) else pil_pages[:max_pages]
+            for pil in pages_to_iter:
+                txt = ocr_pil_image(pil, ocr_lang=ocr_lang, config=tconfig)
+                full_text += "\n" + (txt or "")
+            return clean_text(full_text)
+        except Exception:
+            return ""
 
+# cache results per file + parameters
 @st.cache_data(show_spinner=False)
-def extract_text_cached(file_hash: str, bytes_data: bytes, ocr_lang, max_pages, dpi, force_ocr, psm):
-    return extract_text_and_page1_from_bytes(bytes_data, ocr_lang=ocr_lang, max_pages=max_pages, dpi=dpi, force_ocr=force_ocr, psm=psm)
-
-def extract_from_upload(uploaded_file, ocr_lang="ind", max_pages=None, dpi=200, force_ocr=False, psm=6):
-    """
-    Accepts a Streamlit UploadedFile, returns (full_text, page1_text).
-    Supports PDF, DOCX, and common images.
-    """
-    if uploaded_file is None:
-        return "", ""
-    name = uploaded_file.name.lower()
-    data = uploaded_file.read()
-    uploaded_file.seek(0)
-    if name.endswith(".pdf"):
-        fh = file_sha256_bytes(data)
-        return extract_text_cached(fh, data, ocr_lang, max_pages, dpi, force_ocr, psm)
-    if name.endswith((".docx", ".doc")):
-        try:
-            import docx
-            doc = docx.Document(io.BytesIO(data))
-            paras = [p.text for p in doc.paragraphs]
-            txt = "\n".join(paras)
-            return clean_text(txt), clean_text("\n".join(paras[:30]))
-        except Exception:
-            return "", ""
-    if name.endswith((".png", ".jpg", ".jpeg", ".tiff", ".bmp")):
-        try:
-            pil = Image.open(io.BytesIO(data))
-            tconfig = f"--psm {psm}"
-            ocr_txt = ocr_pil_image(pil, ocr_lang, tconfig)
-            return clean_text(ocr_txt), clean_text(ocr_txt)
-        except Exception:
-            return "", ""
-    return "", ""
+def cached_full_extraction(file_hash: str, bytes_data: bytes, ocr_lang, max_pages, dpi, psm):
+    page1_quick = extract_text_page1_quick(bytes_data, ocr_lang=ocr_lang, dpi=dpi, psm=psm)[0]
+    full = extract_text_limited_or_full(bytes_data, ocr_lang=ocr_lang, max_pages=max_pages, dpi=dpi, psm=psm)
+    return page1_quick, full
 
 # -------------------------
-# Domain extraction logic
+# Domain extraction logic (flexible)
 # -------------------------
 DATE_PATTERN_LONG = r"(\d{1,2}\s+(?:Januari|Februari|Maret|April|Mei|Juni|Juli|Agustus|September|Oktober|November|Desember|Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\w*\s*\d{2,4})"
 DURATION_PATTERN = r"(\d{1,4})\s*(?:hari|kalender|calendar)"
-# flexible nomor kontrak capture: common tokens + fallback broad pattern
 NOMOR_PATTERNS = [
     r"\b(SPERJ\.[A-Z0-9\./\-]+)\b",
     r"\b(Sperj\.[A-Z0-9\./\-]+)\b",
     r"Nomor\s*Kontrak\s*[:\-\s]*([A-Z0-9\/\.\-\_]+)",
-    r"NOMOR\s*[:\-\s]*([A-Z0-9\/\.\-\_]+)"
+    r"NOMOR\s*[:\-\s]*([A-Z0-9\/\.\-\_]+)",
+    r"\b(No\.\s*[A-Z0-9\/\.\-\_]+)\b"
 ]
 PASAL_BIAYA_HEADER = r"Pasal\s*\d+\s*.*?Biaya\s+Pelaksanaan\s+Pekerjaan"
 RP_NUMBER_PATTERN = r"(Rp[\s]*[\d\.,\-\s]+(?:\d))"
@@ -195,26 +190,26 @@ def extract_contract_fields(full_text, page1_text):
         "nilai_kontrak_raw": None,
         "duration_days": None
     }
-    # 1) nomor kontrak: try page1 then full
+    # nomor kontrak: page1 preferred then full
     for p in NOMOR_PATTERNS:
         v = safe_search(p, page1_text) or safe_search(p, full_text)
         if v:
             out["nomor_kontrak"] = v
             break
-    # 2) tanggal mulai: prefer page1, else full
-    d = safe_search(DATE_PATTERN_LONG, page1_text) or safe_search(DATE_PATTERN_LONG, full_text)
+    # tanggal mulai: prefer page1
+    v = safe_search(DATE_PATTERN_LONG, page1_text) or safe_search(DATE_PATTERN_LONG, full_text)
+    if v:
+        out["tanggal_mulai_raw"] = v
+    # duration detection
+    d = safe_search(DURATION_PATTERN, full_text)
     if d:
-        out["tanggal_mulai_raw"] = d
-    # 3) duration days (from pasal jangka waktu)
-    dur = safe_search(DURATION_PATTERN, full_text)
-    if dur:
         try:
-            out["duration_days"] = int(dur)
+            out["duration_days"] = int(d)
         except Exception:
             out["duration_days"] = None
-    # 4) nilai kontrak from Pasal Biaya
+    # nilai kontrak: search Pasal Biaya block
     try:
-        m = re.search(PASAL_BIAYA_HEADER, full_text, flags=re.IGNORECASE|re.DOTALL)
+        m = re.search(PASAL_BIAYA_HEADER, full_text, flags=re.IGNORECASE | re.DOTALL)
     except re.error:
         m = None
     if m:
@@ -237,7 +232,7 @@ def extract_contract_fields(full_text, page1_text):
         if anyrp:
             out["nilai_kontrak_raw"] = anyrp
             out["nilai_kontrak"] = normalize_amount_raw(anyrp)
-    # 5) compute tanggal_selesai if duration & start present
+    # compute tanggal_selesai if duration & start exist
     if out["duration_days"] and out["tanggal_mulai_raw"]:
         dt_start = parse_date_flexible(out["tanggal_mulai_raw"])
         if dt_start:
@@ -259,7 +254,6 @@ def extract_invoice_fields(full_text, page1_text):
     if v:
         out["tanggal_invoice_raw"] = v
         out["tanggal_invoice"] = parse_date_flexible(v)
-    # dpp/ppn/total attempts
     dpp = safe_search(r"DPP[:\s\-]*(Rp[\s\d\.,\-]+)", full_text)
     ppn = safe_search(r"PPN[:\s\-]*(Rp[\s\d\.,\-]+)", full_text)
     total_match = safe_search(r"(Total\s*Invoice[:\s\-]*Rp[\s\d\.,\-]+)|(Jumlah[:\s\-]*Rp[\s\d\.,\-]+)", full_text)
@@ -272,7 +266,7 @@ def extract_invoice_fields(full_text, page1_text):
         out["dpp_raw"] = dpp
     if ppn:
         out["ppn_raw"] = ppn
-    # fallback any Rp if still missing
+    # fallback any Rp
     if not out["total_raw"]:
         anyrp = safe_search(RP_NUMBER_PATTERN, full_text)
         if anyrp:
@@ -281,17 +275,16 @@ def extract_invoice_fields(full_text, page1_text):
     return out
 
 # -------------------------
-# UI & flow
+# UI (fast-first flow)
 # -------------------------
 st.title("Three-Way Matching — Fast + OCR (MVP)")
 
 with st.sidebar:
-    st.header("Performance & OCR settings")
-    # default fast choices: small max_pages, moderate dpi, ind-only language
-    ocr_lang = st.selectbox("OCR language", ["ind","ind+eng","eng"], index=0)
-    max_pages = st.number_input("Max pages to OCR (0 = all)", min_value=0, max_value=200, value=1)
+    st.header("Speed & OCR settings")
+    ocr_lang = st.selectbox("OCR language (single faster)", ["ind","ind+eng","eng"], index=0)
+    max_pages = st.number_input("Max pages to OCR (0 = all)", min_value=0, max_value=200, value=2)
     dpi = st.select_slider("OCR DPI (lower = faster)", options=[150,200,250,300], value=200)
-    force_ocr = st.checkbox("Force OCR for all pages (use if PDF is scanned)", value=False)
+    force_ocr = st.checkbox("Force OCR for all pages (use only if doc is scanned)", value=False)
     psm = st.selectbox("Tesseract PSM (layout hint)", [6,3,4,11], index=0)
     tol_pct = st.number_input("Tolerance % for amount match", min_value=0.0, max_value=100.0, value=0.5)
 
@@ -318,20 +311,18 @@ def safe_rerun():
         except Exception:
             pass
 
-# Process kontrak: fast-first strategy
+# handle kontrak upload with fast-first strategy
 if kontrak_file:
-    bytes_data = kontrak_file.read()
-    mp = None if max_pages==0 else max_pages
-    # 1) Quick read: extract only page1 (no OCR) if possible
-    full_text_quick, page1_quick = extract_text_and_page1_from_bytes(bytes_data, ocr_lang=ocr_lang, max_pages=1, dpi=dpi, force_ocr=False, psm=psm)
-    kontrak = extract_contract_fields(full_text_quick, page1_quick)
-    # If essential fields missing (nomor, tanggal, nilai), run fuller extraction (controlled by max_pages and force_ocr)
-    need_full = False
-    if not kontrak.get("nomor_kontrak") or not kontrak.get("tanggal_mulai_raw") or kontrak.get("nilai_kontrak") is None:
-        need_full = True
+    data_bytes = kontrak_file.read()
+    fh = file_sha256_bytes(data_bytes)
+    # quick page1 attempt (no OCR if page text exists)
+    page1_quick, _ = cached_full_extraction(fh, data_bytes, ocr_lang, 1, dpi, psm)
+    kontrak = extract_contract_fields("", page1_quick)  # use page1_quick as page1_text
+    # if important fields missing -> run limited extraction controlled by max_pages (may OCR some pages)
+    need_full = (not kontrak.get("nomor_kontrak") or not kontrak.get("tanggal_mulai_raw") or kontrak.get("nilai_kontrak") is None)
     if need_full:
-        full_text, page1 = extract_text_and_page1_from_bytes(bytes_data, ocr_lang=ocr_lang, max_pages=mp, dpi=dpi, force_ocr=force_ocr, psm=psm)
-        kontrak = extract_contract_fields(full_text, page1)
+        page1_full, full_text = cached_full_extraction(fh, data_bytes, ocr_lang, max_pages, dpi, psm)
+        kontrak = extract_contract_fields(full_text, page1_full)
     st.session_state["kontrak"] = kontrak
     safe_rerun()
 
@@ -350,9 +341,9 @@ with col2:
         st.write("Belum ada BA")
 
 if ba_file:
-    bytes_data = ba_file.read()
-    mp = None if max_pages==0 else max_pages
-    full_text, page1 = extract_text_and_page1_from_bytes(bytes_data, ocr_lang=ocr_lang, max_pages=mp, dpi=dpi, force_ocr=force_ocr, psm=psm)
+    data_bytes = ba_file.read()
+    fh = file_sha256_bytes(data_bytes)
+    page1, full_text = cached_full_extraction(fh, data_bytes, ocr_lang, max_pages, dpi, psm)
     ba = extract_ba_fields(full_text, page1)
     # validate BA vs contract
     if "kontrak" in st.session_state:
@@ -386,9 +377,9 @@ with col2:
         st.write("Belum ada invoice")
 
 if invoice_file:
-    bytes_data = invoice_file.read()
-    mp = None if max_pages==0 else max_pages
-    full_text, page1 = extract_text_and_page1_from_bytes(bytes_data, ocr_lang=ocr_lang, max_pages=mp, dpi=dpi, force_ocr=force_ocr, psm=psm)
+    data_bytes = invoice_file.read()
+    fh = file_sha256_bytes(data_bytes)
+    page1, full_text = cached_full_extraction(fh, data_bytes, ocr_lang, max_pages, dpi, psm)
     invoice = extract_invoice_fields(full_text, page1)
     # invoice date vs BA
     if "ba" in st.session_state and st.session_state["ba"].get("tanggal_ba") and invoice.get("tanggal_invoice"):
