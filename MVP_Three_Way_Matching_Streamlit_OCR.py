@@ -2,128 +2,132 @@ import streamlit as st
 import pdfplumber
 import pytesseract
 from pdf2image import convert_from_bytes
-import io, re, json
-from datetime import datetime, timedelta
+import io
+import re
 import dateparser
+from datetime import timedelta
 
-# Konfigurasi OCR
-pytesseract.pytesseract.tesseract_cmd = "/usr/bin/tesseract"
+# ============== HELPER FUNCTIONS =================
 
-# Fungsi baca PDF cepat
-def read_pdf_text(file_bytes, max_pages=1):
+def read_pdf_fast(file_bytes, ocr_lang="ind"):
+    """Coba baca PDF cepat dengan pdfplumber, jika kosong baru OCR halaman pertama."""
     text = ""
     try:
         with pdfplumber.open(io.BytesIO(file_bytes)) as pdf:
-            for i, page in enumerate(pdf.pages):
-                if max_pages and i >= max_pages:
-                    break
-                text += page.extract_text() or ""
+            for page in pdf.pages[:1]:  # hanya halaman 1 dulu
+                txt = page.extract_text() or ""
+                text += txt
     except Exception:
-        pass
+        text = ""
+    
+    if not text.strip():  # jika kosong, pakai OCR
+        images = convert_from_bytes(file_bytes, first_page=1, last_page=1)
+        text = pytesseract.image_to_string(images[0], lang=ocr_lang)
+    
     return text
 
-# OCR fallback
-def ocr_pdf_first_page(file_bytes):
-    images = convert_from_bytes(file_bytes, first_page=1, last_page=1)
-    text = pytesseract.image_to_string(images[0], lang="ind")
-    return text
+def extract_nomor_kontrak(text):
+    match = re.search(r"(?:Nomor|No)\s*[:\-]?\s*([A-Za-z0-9\/\.\-]+)", text, re.IGNORECASE)
+    return match.group(1) if match else None
 
-# Ekstraksi kontrak
-def extract_kontrak(text):
-    # Nomor kontrak
-    nomor = re.search(r"(SPERJ\.?|PKS|No\.?|Nomor)\s*[:\-]?\s*([A-Z0-9\/\.\-]+)", text, re.IGNORECASE)
-    nomor_kontrak = nomor.group(2) if nomor else None
+def extract_tanggal_kontrak(text):
+    match = re.search(r"(\d{1,2}\s+(?:Januari|Februari|Maret|April|Mei|Juni|Juli|Agustus|September|Oktober|November|Desember)\s+\d{4})", text, re.IGNORECASE)
+    return match.group(1) if match else None
 
-    # Tanggal mulai
-    tgl_mulai_match = re.search(r"(\d{1,2}\s+(Januari|Februari|Maret|April|Mei|Juni|Juli|Agustus|September|Oktober|November|Desember|Jan|Feb|Mar|Apr|Mei|Jun|Jul|Agu|Sep|Okt|Nov|Des)\s+\d{4})", text)
-    tanggal_mulai = dateparser.parse(tgl_mulai_match.group(1)) if tgl_mulai_match else None
+def extract_durasi(text):
+    match = re.search(r"(\d{1,3})\s*hari\s*kalender", text, re.IGNORECASE)
+    return int(match.group(1)) if match else None
 
-    # Durasi
-    durasi_match = re.search(r"(\d{1,3})\s+hari", text, re.IGNORECASE)
-    durasi = int(durasi_match.group(1)) if durasi_match else None
+def extract_nilai_kontrak(text):
+    match = re.search(r"Rp\s*([\d\.\,]+)", text)
+    return match.group(1) if match else None
 
-    # Tanggal selesai
-    tanggal_selesai = (tanggal_mulai + timedelta(days=durasi)) if (tanggal_mulai and durasi) else None
+def extract_tanggal_ba(text):
+    match = re.search(r"(\d{1,2}\s+(?:Januari|Februari|Maret|April|Mei|Juni|Juli|Agustus|September|Oktober|November|Desember)\s+\d{4})", text, re.IGNORECASE)
+    return match.group(1) if match else None
 
-    # Nilai kontrak
-    nilai_match = re.search(r"Rp[\s\.0-9]+", text)
-    nilai_kontrak = nilai_match.group(0) if nilai_match else None
-
+def extract_invoice_data(text):
+    tgl = extract_tanggal_ba(text)
+    dpp = re.search(r"DPP\s*Rp\s*([\d\.\,]+)", text)
+    ppn = re.search(r"PPN\s*Rp\s*([\d\.\,]+)", text)
+    total = re.search(r"Rp\s*([\d\.\,]+)", text)
     return {
-        "nomor_kontrak": nomor_kontrak,
-        "tanggal_mulai": tanggal_mulai.strftime("%d-%m-%Y") if tanggal_mulai else None,
-        "tanggal_selesai": tanggal_selesai.strftime("%d-%m-%Y") if tanggal_selesai else None,
-        "duration_days": durasi,
-        "nilai_kontrak": nilai_kontrak
+        "tanggal": tgl,
+        "dpp": dpp.group(1) if dpp else None,
+        "ppn": ppn.group(1) if ppn else None,
+        "total": total.group(1) if total else None
     }
 
-# Ekstraksi tanggal dari BA & Invoice
-def extract_tanggal(text):
-    tgl_match = re.search(r"(\d{1,2}\s+(Januari|Februari|Maret|April|Mei|Juni|Juli|Agustus|September|Oktober|November|Desember|Jan|Feb|Mar|Apr|Mei|Jun|Jul|Agu|Sep|Okt|Nov|Des)\s+\d{4})", text)
-    return dateparser.parse(tgl_match.group(1)) if tgl_match else None
+# ============== STREAMLIT APP =================
 
-# Nilai Invoice
-def extract_invoice_values(text):
-    dpp_match = re.search(r"DPP.*?Rp[\s\.0-9]+", text, re.IGNORECASE)
-    ppn_match = re.search(r"PPN.*?Rp[\s\.0-9]+", text, re.IGNORECASE)
-    total_match = re.search(r"Total.*?Rp[\s\.0-9]+", text, re.IGNORECASE)
-    return {
-        "dpp": dpp_match.group(0) if dpp_match else None,
-        "ppn": ppn_match.group(0) if ppn_match else None,
-        "total": total_match.group(0) if total_match else None
-    }
-
-# Streamlit UI
 st.title("📑 Three Way Matching - Hutang Usaha")
 
-# Upload kontrak
-kontrak_file = st.file_uploader("Upload Kontrak", type=["pdf"])
-ba_file = st.file_uploader("Upload Berita Acara (BA)", type=["pdf"])
-invoice_file = st.file_uploader("Upload Invoice", type=["pdf"])
-
-result = {}
+# Step 1: Upload Kontrak
+st.header("1️⃣ Upload Kontrak")
+kontrak_file = st.file_uploader("Upload file kontrak (PDF)", type=["pdf"])
+kontrak_data = {}
 
 if kontrak_file:
-    kontrak_bytes = kontrak_file.read()
-    text = read_pdf_text(kontrak_bytes, max_pages=2)
-    if not text.strip():
-        text = ocr_pdf_first_page(kontrak_bytes)
-    result["kontrak"] = extract_kontrak(text)
+    kontrak_text = read_pdf_fast(kontrak_file.read())
+    kontrak_data["nomor_kontrak"] = extract_nomor_kontrak(kontrak_text)
+    kontrak_data["tanggal_mulai_raw"] = extract_tanggal_kontrak(kontrak_text)
+    kontrak_data["duration_days"] = extract_durasi(kontrak_text)
+    kontrak_data["nilai_kontrak"] = extract_nilai_kontrak(kontrak_text)
 
+    # Hitung tanggal selesai jika ada durasi
+    if kontrak_data["tanggal_mulai_raw"] and kontrak_data["duration_days"]:
+        mulai = dateparser.parse(kontrak_data["tanggal_mulai_raw"])
+        selesai = mulai + timedelta(days=kontrak_data["duration_days"])
+        kontrak_data["tanggal_selesai_raw"] = selesai.strftime("%d %B %Y")
+    else:
+        kontrak_data["tanggal_selesai_raw"] = None
+
+    st.json(kontrak_data)
+
+# Step 2: Upload BA
+st.header("2️⃣ Upload Berita Acara (BA)")
+ba_file = st.file_uploader("Upload file BA (PDF)", type=["pdf"])
+ba_tanggal = None
 if ba_file:
-    ba_bytes = ba_file.read()
-    text = read_pdf_text(ba_bytes, max_pages=1)
-    if not text.strip():
-        text = ocr_pdf_first_page(ba_bytes)
-    result["ba_tanggal"] = extract_tanggal(text)
+    ba_text = read_pdf_fast(ba_file.read())
+    ba_tanggal_raw = extract_tanggal_ba(ba_text)
+    ba_tanggal = dateparser.parse(ba_tanggal_raw) if ba_tanggal_raw else None
+    st.write(f"Tanggal BA: {ba_tanggal_raw or 'Tidak ditemukan'}")
 
-if invoice_file:
-    inv_bytes = invoice_file.read()
-    text = read_pdf_text(inv_bytes, max_pages=1)
-    if not text.strip():
-        text = ocr_pdf_first_page(inv_bytes)
-    result["invoice_tanggal"] = extract_tanggal(text)
-    result["invoice_values"] = extract_invoice_values(text)
+# Step 3: Upload Invoice
+st.header("3️⃣ Upload Invoice")
+inv_file = st.file_uploader("Upload file Invoice (PDF)", type=["pdf"])
+invoice_data = {}
+if inv_file:
+    inv_text = read_pdf_fast(inv_file.read())
+    invoice_data = extract_invoice_data(inv_text)
+    invoice_data["tanggal_parsed"] = dateparser.parse(invoice_data["tanggal"]) if invoice_data["tanggal"] else None
+    st.json(invoice_data)
 
-# Three-way matching check
-if "kontrak" in result and "ba_tanggal" in result:
-    k_mulai = dateparser.parse(result["kontrak"]["tanggal_mulai"])
-    k_selesai = dateparser.parse(result["kontrak"]["tanggal_selesai"])
-    ba_tgl = result["ba_tanggal"]
-    result["ba_vs_kontrak"] = "MATCH" if (ba_tgl and k_mulai <= ba_tgl <= k_selesai) else "NOT MATCH"
+# Step 4: Three Way Matching
+st.header("📊 Hasil Matching")
+if kontrak_data and ba_tanggal and invoice_data:
+    hasil = {}
 
-if "ba_tanggal" in result and "invoice_tanggal" in result:
-    ba_tgl = result["ba_tanggal"]
-    inv_tgl = result["invoice_tanggal"]
-    result["invoice_vs_ba"] = "MATCH" if (inv_tgl and inv_tgl >= ba_tgl) else "NOT MATCH"
+    # Match BA vs Kontrak (tanggal)
+    k_mulai = dateparser.parse(kontrak_data.get("tanggal_mulai_raw")) if kontrak_data.get("tanggal_mulai_raw") else None
+    k_selesai = dateparser.parse(kontrak_data.get("tanggal_selesai_raw")) if kontrak_data.get("tanggal_selesai_raw") else None
+    if k_mulai and k_selesai:
+        hasil["BA_vs_Kontrak"] = "MATCH" if k_mulai <= ba_tanggal <= k_selesai else "NOT MATCH"
+    else:
+        hasil["BA_vs_Kontrak"] = "DATA TIDAK LENGKAP"
 
-if "kontrak" in result and "invoice_values" in result:
-    kontrak_val = result["kontrak"]["nilai_kontrak"]
-    inv_total = result["invoice_values"]["total"]
-    result["invoice_vs_kontrak"] = "MATCH" if (kontrak_val and inv_total and kontrak_val in inv_total) else "NOT MATCH"
+    # Match Invoice vs BA (tanggal)
+    inv_tgl = invoice_data.get("tanggal_parsed")
+    if inv_tgl and ba_tanggal:
+        hasil["Invoice_vs_BA"] = "MATCH" if inv_tgl >= ba_tanggal else "NOT MATCH"
+    else:
+        hasil["Invoice_vs_BA"] = "DATA TIDAK LENGKAP"
 
-# Output JSON
-if result:
-    st.subheader("Hasil Ekstraksi & Matching")
-    st.json(result)
-    st.download_button("Download Hasil JSON", data=json.dumps(result, ensure_ascii=False), file_name="hasil_matching.json", mime="application/json")
+    # Match Nilai Invoice vs Kontrak
+    if kontrak_data.get("nilai_kontrak") and invoice_data.get("total"):
+        hasil["Nilai_Invoice_vs_Kontrak"] = "MATCH" if kontrak_data["nilai_kontrak"] == invoice_data["total"] else "NOT MATCH"
+    else:
+        hasil["Nilai_Invoice_vs_Kontrak"] = "DATA TIDAK LENGKAP"
+
+    st.json(hasil)
